@@ -40,10 +40,11 @@ type AgentLoop struct {
 	sessions       *session.SessionManager
 	state          *state.Manager
 	contextBuilder *ContextBuilder
-	tools          *tools.ToolRegistry
-	running        atomic.Bool
-	summarizing    sync.Map // Tracks which sessions are currently being summarized
-	channelManager *channels.Manager
+	tools           *tools.ToolRegistry
+	running         atomic.Bool
+	summarizing     sync.Map // Tracks which sessions are currently being summarized
+	channelManager  *channels.Manager
+	defaultResponse string
 }
 
 // processOptions configures how a message is processed
@@ -136,18 +137,24 @@ func NewAgentLoop(cfg *config.Config, msgBus *bus.MessageBus, provider providers
 	contextBuilder := NewContextBuilder(workspace)
 	contextBuilder.SetToolsRegistry(toolsRegistry)
 
+	defaultResponse := cfg.Agents.Defaults.DefaultResponse
+	if defaultResponse == "" {
+		defaultResponse = "I've completed processing but have no response to give."
+	}
+
 	return &AgentLoop{
-		bus:            msgBus,
-		provider:       provider,
-		workspace:      workspace,
-		model:          cfg.Agents.Defaults.Model,
-		contextWindow:  cfg.Agents.Defaults.MaxTokens, // Restore context window for summarization
-		maxIterations:  cfg.Agents.Defaults.MaxToolIterations,
-		sessions:       sessionsManager,
-		state:          stateManager,
-		contextBuilder: contextBuilder,
-		tools:          toolsRegistry,
-		summarizing:    sync.Map{},
+		bus:             msgBus,
+		provider:        provider,
+		workspace:       workspace,
+		model:           cfg.Agents.Defaults.Model,
+		contextWindow:   cfg.Agents.Defaults.MaxTokens, // Restore context window for summarization
+		maxIterations:   cfg.Agents.Defaults.MaxToolIterations,
+		sessions:        sessionsManager,
+		state:           stateManager,
+		contextBuilder:  contextBuilder,
+		tools:           toolsRegistry,
+		summarizing:     sync.Map{},
+		defaultResponse: defaultResponse,
 	}
 }
 
@@ -241,7 +248,7 @@ func (al *AgentLoop) ProcessHeartbeat(ctx context.Context, content, channel, cha
 		Channel:         channel,
 		ChatID:          chatID,
 		UserMessage:     content,
-		DefaultResponse: "I've completed processing but have no response to give.",
+		DefaultResponse: al.defaultResponse,
 		EnableSummary:   false,
 		SendResponse:    false,
 		NoHistory:       true, // Don't load session history for heartbeat
@@ -280,7 +287,7 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 		Channel:         msg.Channel,
 		ChatID:          msg.ChatID,
 		UserMessage:     msg.Content,
-		DefaultResponse: "I've completed processing but have no response to give.",
+		DefaultResponse: al.defaultResponse,
 		EnableSummary:   true,
 		SendResponse:    false,
 	})
@@ -375,21 +382,21 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 	al.sessions.AddMessage(opts.SessionKey, "user", opts.UserMessage)
 
 	// 4. Run LLM iteration loop
-	finalContent, iteration, err := al.runLLMIteration(ctx, messages, opts)
+	finalContent, iteration, intermediateContentSent, err := al.runLLMIteration(ctx, messages, opts)
 	if err != nil {
 		return "", err
 	}
 
-	// If last tool had ForUser content and we already sent it, we might not need to send final response
-	// This is controlled by the tool's Silent flag and ForUser content
-
 	// 5. Handle empty response
-	if finalContent == "" {
+	// If intermediate content was already sent to the user, don't apply fallback
+	if finalContent == "" && !intermediateContentSent {
 		finalContent = opts.DefaultResponse
 	}
 
-	// 6. Save final assistant message to session
-	al.sessions.AddMessage(opts.SessionKey, "assistant", finalContent)
+	// 6. Save final assistant message to session (skip if empty)
+	if finalContent != "" {
+		al.sessions.AddMessage(opts.SessionKey, "assistant", finalContent)
+	}
 	al.sessions.Save(opts.SessionKey)
 
 	// 7. Optional: summarization
@@ -419,10 +426,11 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 }
 
 // runLLMIteration executes the LLM call loop with tool handling.
-// Returns the final content, iteration count, and any error.
-func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.Message, opts processOptions) (string, int, error) {
+// Returns the final content, iteration count, whether intermediate content was sent, and any error.
+func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.Message, opts processOptions) (string, int, bool, error) {
 	iteration := 0
 	var finalContent string
+	intermediateContentSent := false
 
 	for iteration < al.maxIterations {
 		iteration++
@@ -588,7 +596,7 @@ func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.M
 					"iteration": iteration,
 					"error":     err.Error(),
 				})
-			return "", iteration, fmt.Errorf("LLM call failed after retries: %w", err)
+			return "", iteration, intermediateContentSent, fmt.Errorf("LLM call failed after retries: %w", err)
 		}
 
 		// Check if no tool calls - we're done
@@ -631,6 +639,21 @@ func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.M
 			})
 		}
 		messages = append(messages, assistantMsg)
+
+		// Publish intermediate content to user (if any)
+		if response.Content != "" && !constants.IsInternalChannel(opts.Channel) {
+			al.bus.PublishOutbound(bus.OutboundMessage{
+				Channel: opts.Channel,
+				ChatID:  opts.ChatID,
+				Content: response.Content,
+			})
+			intermediateContentSent = true
+			logger.DebugCF("agent", "Published intermediate content to user",
+				map[string]interface{}{
+					"iteration":     iteration,
+					"content_chars": len(response.Content),
+				})
+		}
 
 		// Save assistant message with tool calls to session
 		al.sessions.AddFullMessage(opts.SessionKey, assistantMsg)
@@ -696,7 +719,7 @@ func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.M
 		}
 	}
 
-	return finalContent, iteration, nil
+	return finalContent, iteration, intermediateContentSent, nil
 }
 
 // updateToolContexts updates the context for tools that need channel/chatID info.

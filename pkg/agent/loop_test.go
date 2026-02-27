@@ -624,3 +624,230 @@ func TestAgentLoop_ContextExhaustionRetry(t *testing.T) {
 		t.Errorf("Expected history to be compressed (len < 8), got %d", len(finalHistory))
 	}
 }
+
+// intermediateContentMockProvider returns content + tool_calls on first call,
+// then content-only on second call (simulating intermediate + final response).
+type intermediateContentMockProvider struct {
+	callCount int
+}
+
+func (m *intermediateContentMockProvider) Chat(ctx context.Context, messages []providers.Message, toolDefs []providers.ToolDefinition, model string, opts map[string]interface{}) (*providers.LLMResponse, error) {
+	m.callCount++
+	if m.callCount == 1 {
+		return &providers.LLMResponse{
+			Content: "Let me look that up!",
+			ToolCalls: []providers.ToolCall{
+				{
+					ID:        "call_1",
+					Name:      "read_file",
+					Arguments: map[string]interface{}{"path": "test.txt"},
+				},
+			},
+		}, nil
+	}
+	return &providers.LLMResponse{
+		Content:   "Here is the result.",
+		ToolCalls: []providers.ToolCall{},
+	}, nil
+}
+
+func (m *intermediateContentMockProvider) GetDefaultModel() string {
+	return "mock-model"
+}
+
+// intermediateOnlyMockProvider returns content + tool_calls on first call,
+// then empty content on second call (simulating no final response).
+type intermediateOnlyMockProvider struct {
+	callCount int
+}
+
+func (m *intermediateOnlyMockProvider) Chat(ctx context.Context, messages []providers.Message, toolDefs []providers.ToolDefinition, model string, opts map[string]interface{}) (*providers.LLMResponse, error) {
+	m.callCount++
+	if m.callCount == 1 {
+		return &providers.LLMResponse{
+			Content: "Let me check on that!",
+			ToolCalls: []providers.ToolCall{
+				{
+					ID:        "call_1",
+					Name:      "read_file",
+					Arguments: map[string]interface{}{"path": "test.txt"},
+				},
+			},
+		}, nil
+	}
+	return &providers.LLMResponse{
+		Content:   "",
+		ToolCalls: []providers.ToolCall{},
+	}, nil
+}
+
+func (m *intermediateOnlyMockProvider) GetDefaultModel() string {
+	return "mock-model"
+}
+
+func TestIntermediateContentPublished(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "agent-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace:         tmpDir,
+				Model:             "test-model",
+				MaxTokens:         4096,
+				MaxToolIterations: 10,
+			},
+		},
+	}
+
+	msgBus := bus.NewMessageBus()
+	provider := &intermediateContentMockProvider{}
+	al := NewAgentLoop(cfg, msgBus, provider)
+
+	// Subscribe to outbound messages to capture intermediate content
+	var outboundMessages []string
+	done := make(chan struct{})
+	go func() {
+		for {
+			msg, ok := msgBus.SubscribeOutbound(context.Background())
+			if !ok {
+				break
+			}
+			outboundMessages = append(outboundMessages, msg.Content)
+			if len(outboundMessages) >= 1 {
+				close(done)
+				return
+			}
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), responseTimeout)
+	defer cancel()
+
+	msg := bus.InboundMessage{
+		Channel:    "discord",
+		SenderID:   "user1",
+		ChatID:     "chat1",
+		Content:    "look up something",
+		SessionKey: "test-intermediate",
+	}
+
+	response, err := al.processMessage(ctx, msg)
+	if err != nil {
+		t.Fatalf("processMessage failed: %v", err)
+	}
+
+	// Final response should be the second LLM call's content
+	if response != "Here is the result." {
+		t.Errorf("Expected final response 'Here is the result.', got: %s", response)
+	}
+
+	// Wait for outbound message
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Timed out waiting for intermediate content on bus")
+	}
+
+	// Verify intermediate content was published
+	if len(outboundMessages) == 0 {
+		t.Fatal("Expected intermediate content to be published to bus")
+	}
+	if outboundMessages[0] != "Let me look that up!" {
+		t.Errorf("Expected intermediate content 'Let me look that up!', got: %s", outboundMessages[0])
+	}
+}
+
+func TestNoDefaultResponseWhenIntermediateContentSent(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "agent-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace:         tmpDir,
+				Model:             "test-model",
+				MaxTokens:         4096,
+				MaxToolIterations: 10,
+			},
+		},
+	}
+
+	msgBus := bus.NewMessageBus()
+	provider := &intermediateOnlyMockProvider{}
+	al := NewAgentLoop(cfg, msgBus, provider)
+
+	ctx, cancel := context.WithTimeout(context.Background(), responseTimeout)
+	defer cancel()
+
+	msg := bus.InboundMessage{
+		Channel:    "discord",
+		SenderID:   "user1",
+		ChatID:     "chat1",
+		Content:    "do something",
+		SessionKey: "test-no-fallback",
+	}
+
+	response, err := al.processMessage(ctx, msg)
+	if err != nil {
+		t.Fatalf("processMessage failed: %v", err)
+	}
+
+	// When intermediate content was sent and final is empty,
+	// the response should be empty (no fallback message)
+	if response != "" {
+		t.Errorf("Expected empty response (no fallback), got: %s", response)
+	}
+}
+
+func TestDefaultResponseConfigurable(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "agent-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	customResponse := "カスタムフォールバック"
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace:         tmpDir,
+				Model:             "test-model",
+				MaxTokens:         4096,
+				MaxToolIterations: 10,
+				DefaultResponse:   customResponse,
+			},
+		},
+	}
+
+	msgBus := bus.NewMessageBus()
+	// Use a provider that returns empty content (triggers fallback)
+	provider := &simpleMockProvider{response: ""}
+	al := NewAgentLoop(cfg, msgBus, provider)
+
+	ctx, cancel := context.WithTimeout(context.Background(), responseTimeout)
+	defer cancel()
+
+	msg := bus.InboundMessage{
+		Channel:    "discord",
+		SenderID:   "user1",
+		ChatID:     "chat1",
+		Content:    "hello",
+		SessionKey: "test-custom-default",
+	}
+
+	response, err := al.processMessage(ctx, msg)
+	if err != nil {
+		t.Fatalf("processMessage failed: %v", err)
+	}
+
+	if response != customResponse {
+		t.Errorf("Expected custom default response '%s', got: %s", customResponse, response)
+	}
+}
