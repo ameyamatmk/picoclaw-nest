@@ -15,7 +15,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 	"unicode/utf8"
 
 	"github.com/sipeed/picoclaw/pkg/bus"
@@ -41,10 +40,12 @@ type AgentLoop struct {
 	state          *state.Manager
 	contextBuilder *ContextBuilder
 	tools           *tools.ToolRegistry
-	running         atomic.Bool
-	summarizing     sync.Map // Tracks which sessions are currently being summarized
-	channelManager  *channels.Manager
-	defaultResponse string
+	running          atomic.Bool
+	summarizing      sync.Map // Tracks which sessions are currently being summarized
+	channelManager   *channels.Manager
+	defaultResponse  string
+	messageThreshold int // メッセージドロップ閾値
+	keepLastMessages int // ドロップ後の保持件数
 }
 
 // processOptions configures how a message is processed
@@ -142,6 +143,15 @@ func NewAgentLoop(cfg *config.Config, msgBus *bus.MessageBus, provider providers
 		defaultResponse = "I've completed processing but have no response to give."
 	}
 
+	messageThreshold := cfg.Agents.Defaults.MessageThreshold
+	if messageThreshold <= 0 {
+		messageThreshold = 40
+	}
+	keepLastMessages := cfg.Agents.Defaults.KeepLastMessages
+	if keepLastMessages <= 0 {
+		keepLastMessages = 10
+	}
+
 	return &AgentLoop{
 		bus:             msgBus,
 		provider:        provider,
@@ -153,8 +163,10 @@ func NewAgentLoop(cfg *config.Config, msgBus *bus.MessageBus, provider providers
 		state:           stateManager,
 		contextBuilder:  contextBuilder,
 		tools:           toolsRegistry,
-		summarizing:     sync.Map{},
-		defaultResponse: defaultResponse,
+		summarizing:      sync.Map{},
+		defaultResponse:  defaultResponse,
+		messageThreshold: messageThreshold,
+		keepLastMessages: keepLastMessages,
 	}
 }
 
@@ -742,28 +754,41 @@ func (al *AgentLoop) updateToolContexts(channel, chatID string) {
 	}
 }
 
-// maybeSummarize triggers summarization if the session history exceeds thresholds.
+// maybeSummarize drops old messages if the session history exceeds thresholds.
 func (al *AgentLoop) maybeSummarize(sessionKey, channel, chatID string) {
-	newHistory := al.sessions.GetHistory(sessionKey)
-	tokenEstimate := al.estimateTokens(newHistory)
+	history := al.sessions.GetHistory(sessionKey)
+	tokenEstimate := al.estimateTokens(history)
 	threshold := al.contextWindow * 75 / 100
 
-	if len(newHistory) > 20 || tokenEstimate > threshold {
-		if _, loading := al.summarizing.LoadOrStore(sessionKey, true); !loading {
-			go func() {
-				defer al.summarizing.Delete(sessionKey)
-				// Notify user about optimization if not an internal channel
-				if !constants.IsInternalChannel(channel) {
-					al.bus.PublishOutbound(bus.OutboundMessage{
-						Channel: channel,
-						ChatID:  chatID,
-						Content: "⚠️ Memory threshold reached. Optimizing conversation history...",
-					})
-				}
-				al.summarizeSession(sessionKey)
-			}()
-		}
+	if len(history) <= al.messageThreshold && tokenEstimate <= threshold {
+		return
 	}
+
+	if _, loading := al.summarizing.LoadOrStore(sessionKey, true); !loading {
+		go func() {
+			defer al.summarizing.Delete(sessionKey)
+			al.dropOldMessages(sessionKey)
+		}()
+	}
+}
+
+// dropOldMessages drops old messages, keeping only the last keepLastMessages.
+func (al *AgentLoop) dropOldMessages(sessionKey string) {
+	history := al.sessions.GetHistory(sessionKey)
+	if len(history) <= al.keepLastMessages {
+		return
+	}
+
+	droppedCount := len(history) - al.keepLastMessages
+	al.sessions.TruncateHistory(sessionKey, al.keepLastMessages)
+	al.sessions.SetSummary(sessionKey, "")
+	al.sessions.Save(sessionKey)
+
+	logger.InfoCF("agent", "Dropped old messages", map[string]interface{}{
+		"session_key":  sessionKey,
+		"dropped_msgs": droppedCount,
+		"kept_msgs":    al.keepLastMessages,
+	})
 }
 
 // forceCompression aggressively reduces context when the limit is hit.
@@ -894,101 +919,6 @@ func formatToolsForLog(tools []providers.ToolDefinition) string {
 	return result
 }
 
-// summarizeSession summarizes the conversation history for a session.
-func (al *AgentLoop) summarizeSession(sessionKey string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-	defer cancel()
-
-	history := al.sessions.GetHistory(sessionKey)
-	summary := al.sessions.GetSummary(sessionKey)
-
-	// Keep last 4 messages for continuity
-	if len(history) <= 4 {
-		return
-	}
-
-	toSummarize := history[:len(history)-4]
-
-	// Oversized Message Guard
-	// Skip messages larger than 50% of context window to prevent summarizer overflow
-	maxMessageTokens := al.contextWindow / 2
-	validMessages := make([]providers.Message, 0)
-	omitted := false
-
-	for _, m := range toSummarize {
-		if m.Role != "user" && m.Role != "assistant" {
-			continue
-		}
-		// Estimate tokens for this message
-		msgTokens := len(m.Content) / 2 // Use safer estimate here too (2.5 -> 2 for integer division safety)
-		if msgTokens > maxMessageTokens {
-			omitted = true
-			continue
-		}
-		validMessages = append(validMessages, m)
-	}
-
-	if len(validMessages) == 0 {
-		return
-	}
-
-	// Multi-Part Summarization
-	// Split into two parts if history is significant
-	var finalSummary string
-	if len(validMessages) > 10 {
-		mid := len(validMessages) / 2
-		part1 := validMessages[:mid]
-		part2 := validMessages[mid:]
-
-		s1, _ := al.summarizeBatch(ctx, part1, "")
-		s2, _ := al.summarizeBatch(ctx, part2, "")
-
-		// Merge them
-		mergePrompt := fmt.Sprintf("Merge these two conversation summaries into one cohesive summary:\n\n1: %s\n\n2: %s", s1, s2)
-		resp, err := al.provider.Chat(ctx, []providers.Message{{Role: "user", Content: mergePrompt}}, nil, al.model, map[string]interface{}{
-			"max_tokens":  1024,
-			"temperature": 0.3,
-		})
-		if err == nil {
-			finalSummary = resp.Content
-		} else {
-			finalSummary = s1 + " " + s2
-		}
-	} else {
-		finalSummary, _ = al.summarizeBatch(ctx, validMessages, summary)
-	}
-
-	if omitted && finalSummary != "" {
-		finalSummary += "\n[Note: Some oversized messages were omitted from this summary for efficiency.]"
-	}
-
-	if finalSummary != "" {
-		al.sessions.SetSummary(sessionKey, finalSummary)
-		al.sessions.TruncateHistory(sessionKey, 4)
-		al.sessions.Save(sessionKey)
-	}
-}
-
-// summarizeBatch summarizes a batch of messages.
-func (al *AgentLoop) summarizeBatch(ctx context.Context, batch []providers.Message, existingSummary string) (string, error) {
-	prompt := "Provide a concise summary of this conversation segment, preserving core context and key points.\n"
-	if existingSummary != "" {
-		prompt += "Existing context: " + existingSummary + "\n"
-	}
-	prompt += "\nCONVERSATION:\n"
-	for _, m := range batch {
-		prompt += fmt.Sprintf("%s: %s\n", m.Role, m.Content)
-	}
-
-	response, err := al.provider.Chat(ctx, []providers.Message{{Role: "user", Content: prompt}}, nil, al.model, map[string]interface{}{
-		"max_tokens":  1024,
-		"temperature": 0.3,
-	})
-	if err != nil {
-		return "", err
-	}
-	return response.Content, nil
-}
 
 // estimateTokens estimates the number of tokens in a message list.
 // Uses a safe heuristic of 2.5 characters per token to account for CJK and other

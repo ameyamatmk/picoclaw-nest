@@ -67,6 +67,9 @@ type AgentDefaults struct {
 	Temperature         float64 `json:"temperature" env:"PICOCLAW_AGENTS_DEFAULTS_TEMPERATURE"`
 	MaxToolIterations   int     `json:"max_tool_iterations" env:"PICOCLAW_AGENTS_DEFAULTS_MAX_TOOL_ITERATIONS"`
 	DefaultResponse     string  `json:"default_response" env:"PICOCLAW_AGENTS_DEFAULTS_DEFAULT_RESPONSE"`
+	MessageThreshold    int     `json:"message_threshold" env:"PICOCLAW_AGENTS_DEFAULTS_MESSAGE_THRESHOLD"`
+	KeepLastMessages    int     `json:"keep_last_messages" env:"PICOCLAW_AGENTS_DEFAULTS_KEEP_LAST_MESSAGES"`
+	IdleTimeoutMinutes  int     `json:"idle_timeout_minutes" env:"PICOCLAW_AGENTS_DEFAULTS_IDLE_TIMEOUT_MINUTES"`
 }
 
 type ChannelsConfig struct {
@@ -227,6 +230,9 @@ func DefaultConfig() *Config {
 				MaxTokens:           8192,
 				Temperature:         0.7,
 				MaxToolIterations:   20,
+				MessageThreshold:    40,
+				KeepLastMessages:    10,
+				IdleTimeoutMinutes:  30,
 			},
 		},
 		Channels: ChannelsConfig{
