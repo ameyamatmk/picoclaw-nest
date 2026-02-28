@@ -404,12 +404,18 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 			"matched_by":  route.MatchedBy,
 		})
 
+	// DefaultResponse: config で設定されていればそれを使い、なければ定数を使用
+	dr := defaultResponse
+	if al.cfg.Agents.Defaults.DefaultResponse != "" {
+		dr = al.cfg.Agents.Defaults.DefaultResponse
+	}
+
 	return al.runAgentLoop(ctx, agent, processOptions{
 		SessionKey:      sessionKey,
 		Channel:         msg.Channel,
 		ChatID:          msg.ChatID,
 		UserMessage:     msg.Content,
-		DefaultResponse: defaultResponse,
+		DefaultResponse: dr,
 		EnableSummary:   true,
 		SendResponse:    false,
 	})
@@ -510,16 +516,21 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, agent *AgentInstance, opt
 	agent.Sessions.AddMessage(opts.SessionKey, "user", opts.UserMessage)
 
 	// 4. Run LLM iteration loop
-	finalContent, iteration, err := al.runLLMIteration(ctx, agent, messages, opts)
+	finalContent, iteration, intermediateContentSent, err := al.runLLMIteration(ctx, agent, messages, opts)
 	if err != nil {
 		return "", err
 	}
 
-	// If last tool had ForUser content and we already sent it, we might not need to send final response
-	// This is controlled by the tool's Silent flag and ForUser content
-
 	// 5. Handle empty response
+	// 中間コンテンツが送信済みの場合、フォールバックメッセージは不要
 	if finalContent == "" {
+		if intermediateContentSent {
+			// 中間コンテンツ送信済みなら空レスポンスをセッションに保存しない
+			if opts.EnableSummary {
+				al.maybeSummarize(agent, opts.SessionKey, opts.Channel, opts.ChatID)
+			}
+			return "", nil
+		}
 		finalContent = opts.DefaultResponse
 	}
 
@@ -608,14 +619,18 @@ func (al *AgentLoop) handleReasoning(ctx context.Context, reasoningContent, chan
 }
 
 // runLLMIteration executes the LLM call loop with tool handling.
+// Returns (finalContent, iteration, intermediateContentSent, error).
+// intermediateContentSent is true when intermediate text (from tool-call responses)
+// has already been delivered to the user via PublishOutbound.
 func (al *AgentLoop) runLLMIteration(
 	ctx context.Context,
 	agent *AgentInstance,
 	messages []providers.Message,
 	opts processOptions,
-) (string, int, error) {
+) (string, int, bool, error) {
 	iteration := 0
 	var finalContent string
+	intermediateContentSent := false
 
 	for iteration < agent.MaxIterations {
 		iteration++
@@ -755,7 +770,7 @@ func (al *AgentLoop) runLLMIteration(
 					"iteration": iteration,
 					"error":     err.Error(),
 				})
-			return "", iteration, fmt.Errorf("LLM call failed after retries: %w", err)
+			return "", iteration, false, fmt.Errorf("LLM call failed after retries: %w", err)
 		}
 
 		go al.handleReasoning(ctx, response.Reasoning, opts.Channel, al.targetReasoningChannelID(opts.Channel))
@@ -780,6 +795,22 @@ func (al *AgentLoop) runLLMIteration(
 					"content_chars": len(finalContent),
 				})
 			break
+		}
+
+		// ツールコール付きレスポンスの Content（中間テキスト）を即座に配信
+		if response.Content != "" && !constants.IsInternalChannel(opts.Channel) {
+			al.bus.PublishOutbound(ctx, bus.OutboundMessage{
+				Channel: opts.Channel,
+				ChatID:  opts.ChatID,
+				Content: response.Content,
+			})
+			intermediateContentSent = true
+			logger.DebugCF("agent", "Published intermediate content",
+				map[string]any{
+					"agent_id":      agent.ID,
+					"iteration":     iteration,
+					"content_chars": len(response.Content),
+				})
 		}
 
 		normalizedToolCalls := make([]providers.ToolCall, 0, len(response.ToolCalls))
@@ -923,7 +954,7 @@ func (al *AgentLoop) runLLMIteration(
 		}
 	}
 
-	return finalContent, iteration, nil
+	return finalContent, iteration, intermediateContentSent, nil
 }
 
 // updateToolContexts updates the context for tools that need channel/chatID info.
@@ -946,22 +977,35 @@ func (al *AgentLoop) updateToolContexts(agent *AgentInstance, channel, chatID st
 	}
 }
 
-// maybeSummarize triggers summarization if the session history exceeds thresholds.
+// maybeSummarize は履歴が閾値を超えた場合に古いメッセージをドロップする。
+// LLM ベースの要約は使わず、単純に古いメッセージを切り捨てる。
 func (al *AgentLoop) maybeSummarize(agent *AgentInstance, sessionKey, channel, chatID string) {
-	newHistory := agent.Sessions.GetHistory(sessionKey)
-	tokenEstimate := al.estimateTokens(newHistory)
-	threshold := agent.ContextWindow * 75 / 100
-
-	if len(newHistory) > 20 || tokenEstimate > threshold {
-		summarizeKey := agent.ID + ":" + sessionKey
-		if _, loading := al.summarizing.LoadOrStore(summarizeKey, true); !loading {
-			go func() {
-				defer al.summarizing.Delete(summarizeKey)
-				logger.Debug("Memory threshold reached. Optimizing conversation history...")
-				al.summarizeSession(agent, sessionKey)
-			}()
-		}
+	messageThreshold := al.cfg.Agents.Defaults.MessageThreshold
+	if messageThreshold <= 0 {
+		messageThreshold = 40
 	}
+	keepLastMessages := al.cfg.Agents.Defaults.KeepLastMessages
+	if keepLastMessages <= 0 {
+		keepLastMessages = 10
+	}
+
+	history := agent.Sessions.GetHistory(sessionKey)
+	if len(history) <= messageThreshold {
+		return
+	}
+
+	droppedCount := len(history) - keepLastMessages
+	agent.Sessions.TruncateHistory(sessionKey, keepLastMessages)
+	agent.Sessions.SetSummary(sessionKey, "")
+	agent.Sessions.Save(sessionKey)
+
+	logger.InfoCF("agent", "Dropped old messages",
+		map[string]any{
+			"session_key":  sessionKey,
+			"dropped":      droppedCount,
+			"kept":         keepLastMessages,
+			"was_messages": len(history),
+		})
 }
 
 // forceCompression aggressively reduces context when the limit is hit.
@@ -1096,124 +1140,6 @@ func formatToolsForLog(toolDefs []providers.ToolDefinition) string {
 	return sb.String()
 }
 
-// summarizeSession summarizes the conversation history for a session.
-func (al *AgentLoop) summarizeSession(agent *AgentInstance, sessionKey string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-	defer cancel()
-
-	history := agent.Sessions.GetHistory(sessionKey)
-	summary := agent.Sessions.GetSummary(sessionKey)
-
-	// Keep last 4 messages for continuity
-	if len(history) <= 4 {
-		return
-	}
-
-	toSummarize := history[:len(history)-4]
-
-	// Oversized Message Guard
-	maxMessageTokens := agent.ContextWindow / 2
-	validMessages := make([]providers.Message, 0)
-	omitted := false
-
-	for _, m := range toSummarize {
-		if m.Role != "user" && m.Role != "assistant" {
-			continue
-		}
-		msgTokens := len(m.Content) / 2
-		if msgTokens > maxMessageTokens {
-			omitted = true
-			continue
-		}
-		validMessages = append(validMessages, m)
-	}
-
-	if len(validMessages) == 0 {
-		return
-	}
-
-	// Multi-Part Summarization
-	var finalSummary string
-	if len(validMessages) > 10 {
-		mid := len(validMessages) / 2
-		part1 := validMessages[:mid]
-		part2 := validMessages[mid:]
-
-		s1, _ := al.summarizeBatch(ctx, agent, part1, "")
-		s2, _ := al.summarizeBatch(ctx, agent, part2, "")
-
-		mergePrompt := fmt.Sprintf(
-			"Merge these two conversation summaries into one cohesive summary:\n\n1: %s\n\n2: %s",
-			s1,
-			s2,
-		)
-		resp, err := agent.Provider.Chat(
-			ctx,
-			[]providers.Message{{Role: "user", Content: mergePrompt}},
-			nil,
-			agent.Model,
-			map[string]any{
-				"max_tokens":       1024,
-				"temperature":      0.3,
-				"prompt_cache_key": agent.ID,
-			},
-		)
-		if err == nil {
-			finalSummary = resp.Content
-		} else {
-			finalSummary = s1 + " " + s2
-		}
-	} else {
-		finalSummary, _ = al.summarizeBatch(ctx, agent, validMessages, summary)
-	}
-
-	if omitted && finalSummary != "" {
-		finalSummary += "\n[Note: Some oversized messages were omitted from this summary for efficiency.]"
-	}
-
-	if finalSummary != "" {
-		agent.Sessions.SetSummary(sessionKey, finalSummary)
-		agent.Sessions.TruncateHistory(sessionKey, 4)
-		agent.Sessions.Save(sessionKey)
-	}
-}
-
-// summarizeBatch summarizes a batch of messages.
-func (al *AgentLoop) summarizeBatch(
-	ctx context.Context,
-	agent *AgentInstance,
-	batch []providers.Message,
-	existingSummary string,
-) (string, error) {
-	var sb strings.Builder
-	sb.WriteString("Provide a concise summary of this conversation segment, preserving core context and key points.\n")
-	if existingSummary != "" {
-		sb.WriteString("Existing context: ")
-		sb.WriteString(existingSummary)
-		sb.WriteString("\n")
-	}
-	sb.WriteString("\nCONVERSATION:\n")
-	for _, m := range batch {
-		fmt.Fprintf(&sb, "%s: %s\n", m.Role, m.Content)
-	}
-	prompt := sb.String()
-
-	response, err := agent.Provider.Chat(
-		ctx,
-		[]providers.Message{{Role: "user", Content: prompt}},
-		nil,
-		agent.Model,
-		map[string]any{
-			"max_tokens":       1024,
-			"temperature":      0.3,
-			"prompt_cache_key": agent.ID,
-		},
-	)
-	if err != nil {
-		return "", err
-	}
-	return response.Content, nil
-}
 
 // estimateTokens estimates the number of tokens in a message list.
 // Uses a safe heuristic of 2.5 characters per token to account for CJK and other
