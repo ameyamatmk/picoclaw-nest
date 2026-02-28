@@ -17,6 +17,9 @@ func DefaultConfig() *Config {
 				MaxTokens:           32768,
 				Temperature:         nil, // nil means use provider default
 				MaxToolIterations:   50,
+				MessageThreshold:   40,
+				KeepLastMessages:   10,
+				IdleTimeoutMinutes: 30,
 			},
 		},
 		Bindings: []AgentBinding{},

@@ -179,6 +179,10 @@ type AgentDefaults struct {
 	MaxTokens           int      `json:"max_tokens"                      env:"PICOCLAW_AGENTS_DEFAULTS_MAX_TOKENS"`
 	Temperature         *float64 `json:"temperature,omitempty"           env:"PICOCLAW_AGENTS_DEFAULTS_TEMPERATURE"`
 	MaxToolIterations   int      `json:"max_tool_iterations"             env:"PICOCLAW_AGENTS_DEFAULTS_MAX_TOOL_ITERATIONS"`
+	DefaultResponse    string   `json:"default_response,omitempty"      env:"PICOCLAW_AGENTS_DEFAULTS_DEFAULT_RESPONSE"`
+	MessageThreshold   int      `json:"message_threshold,omitempty"     env:"PICOCLAW_AGENTS_DEFAULTS_MESSAGE_THRESHOLD"`
+	KeepLastMessages   int      `json:"keep_last_messages,omitempty"    env:"PICOCLAW_AGENTS_DEFAULTS_KEEP_LAST_MESSAGES"`
+	IdleTimeoutMinutes int      `json:"idle_timeout_minutes,omitempty"  env:"PICOCLAW_AGENTS_DEFAULTS_IDLE_TIMEOUT_MINUTES"`
 }
 
 // GetModelName returns the effective model name for the agent defaults.

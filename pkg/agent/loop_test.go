@@ -851,3 +851,259 @@ func TestHandleReasoning(t *testing.T) {
 		}
 	})
 }
+
+// --- nest パッチのテスト ---
+
+// intermediateContentMockProvider はツールコール付きレスポンスを返し、
+// 2回目以降は直接レスポンスを返す。
+type intermediateContentMockProvider struct {
+	intermediateContent string // ツールコール時に一緒に返すテキスト
+	finalContent        string // 最終レスポンス
+	callCount           int
+}
+
+func (m *intermediateContentMockProvider) Chat(
+	ctx context.Context,
+	messages []providers.Message,
+	tds []providers.ToolDefinition,
+	model string,
+	opts map[string]any,
+) (*providers.LLMResponse, error) {
+	m.callCount++
+	if m.callCount == 1 {
+		// 1回目: ツールコール + 中間テキスト
+		return &providers.LLMResponse{
+			Content: m.intermediateContent,
+			ToolCalls: []providers.ToolCall{
+				{
+					ID:   "call-1",
+					Type: "function",
+					Name: "mock_custom",
+					Function: &providers.FunctionCall{
+						Name:      "mock_custom",
+						Arguments: "{}",
+					},
+				},
+			},
+		}, nil
+	}
+	// 2回目以降: 直接レスポンス
+	return &providers.LLMResponse{
+		Content:   m.finalContent,
+		ToolCalls: []providers.ToolCall{},
+	}, nil
+}
+
+func (m *intermediateContentMockProvider) GetDefaultModel() string {
+	return "mock-model"
+}
+
+// TestIntermediateContentPublished は、ツールコール付きレスポンスの Content が
+// bus に配信されることを検証する。
+func TestIntermediateContentPublished(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "agent-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace:         tmpDir,
+				Model:             "test-model",
+				MaxTokens:         4096,
+				MaxToolIterations: 10,
+			},
+		},
+	}
+
+	msgBus := bus.NewMessageBus()
+	provider := &intermediateContentMockProvider{
+		intermediateContent: "調べてみるね！",
+		finalContent:        "結果はこうだよ",
+	}
+	al := NewAgentLoop(cfg, msgBus, provider)
+
+	// ツール登録
+	al.RegisterTool(&mockCustomTool{})
+
+	// processMessage を実行
+	ctx := context.Background()
+	msg := bus.InboundMessage{
+		Channel:    "discord",
+		SenderID:   "user1",
+		ChatID:     "chat1",
+		Content:    "テスト",
+		SessionKey: "test-intermediate",
+	}
+
+	response, err := al.processMessage(ctx, msg)
+	if err != nil {
+		t.Fatalf("processMessage failed: %v", err)
+	}
+
+	if response != "結果はこうだよ" {
+		t.Errorf("Expected final response '結果はこうだよ', got '%s'", response)
+	}
+
+	// bus に中間コンテンツが配信されていることを確認
+	subCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+	defer cancel()
+	outMsg, ok := msgBus.SubscribeOutbound(subCtx)
+	if !ok {
+		t.Fatal("Expected intermediate content to be published to bus")
+	}
+	if outMsg.Content != "調べてみるね！" {
+		t.Errorf("Expected intermediate content '調べてみるね！', got '%s'", outMsg.Content)
+	}
+}
+
+// TestNoDefaultResponseWhenIntermediateContentSent は、中間コンテンツが送信済みの場合に
+// 空レスポンス時のフォールバック (DefaultResponse) が抑制されることを検証する。
+func TestNoDefaultResponseWhenIntermediateContentSent(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "agent-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace:         tmpDir,
+				Model:             "test-model",
+				MaxTokens:         4096,
+				MaxToolIterations: 10,
+			},
+		},
+	}
+
+	msgBus := bus.NewMessageBus()
+	provider := &intermediateContentMockProvider{
+		intermediateContent: "処理中だよ！",
+		finalContent:        "", // 空レスポンス
+	}
+	al := NewAgentLoop(cfg, msgBus, provider)
+	al.RegisterTool(&mockCustomTool{})
+
+	ctx := context.Background()
+	msg := bus.InboundMessage{
+		Channel:    "discord",
+		SenderID:   "user1",
+		ChatID:     "chat1",
+		Content:    "テスト",
+		SessionKey: "test-no-default",
+	}
+
+	response, err := al.processMessage(ctx, msg)
+	if err != nil {
+		t.Fatalf("processMessage failed: %v", err)
+	}
+
+	// 中間コンテンツ送信済みなのでフォールバックは抑制され、空文字が返る
+	if response != "" {
+		t.Errorf("Expected empty response (fallback suppressed), got '%s'", response)
+	}
+}
+
+// TestDefaultResponseConfigurable は、config の DefaultResponse がカスタマイズ可能であることを検証する。
+func TestDefaultResponseConfigurable(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "agent-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	customResponse := "カスタムレスポンスだよ"
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace:         tmpDir,
+				Model:             "test-model",
+				MaxTokens:         4096,
+				MaxToolIterations: 10,
+				DefaultResponse:   customResponse,
+			},
+		},
+	}
+
+	msgBus := bus.NewMessageBus()
+	// 空レスポンスを返す provider
+	provider := &simpleMockProvider{response: ""}
+	al := NewAgentLoop(cfg, msgBus, provider)
+
+	ctx := context.Background()
+	msg := bus.InboundMessage{
+		Channel:    "discord",
+		SenderID:   "user1",
+		ChatID:     "chat1",
+		Content:    "テスト",
+		SessionKey: "test-custom-default",
+	}
+
+	response, err := al.processMessage(ctx, msg)
+	if err != nil {
+		t.Fatalf("processMessage failed: %v", err)
+	}
+
+	if response != customResponse {
+		t.Errorf("Expected custom default response '%s', got '%s'", customResponse, response)
+	}
+}
+
+// TestDropOldMessages は、メッセージ数が閾値を超えた場合に古いメッセージがドロップされることを検証する。
+func TestDropOldMessages(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "agent-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace:         tmpDir,
+				Model:             "test-model",
+				MaxTokens:         4096,
+				MaxToolIterations: 10,
+				MessageThreshold:  5, // 5件超えたらドロップ
+				KeepLastMessages:  3, // 3件だけ保持
+			},
+		},
+	}
+
+	msgBus := bus.NewMessageBus()
+	provider := &simpleMockProvider{response: "response"}
+	al := NewAgentLoop(cfg, msgBus, provider)
+
+	defaultAgent := al.registry.GetDefaultAgent()
+	if defaultAgent == nil {
+		t.Fatal("No default agent found")
+	}
+
+	sessionKey := "test-drop"
+
+	// セッションを作成してからメッセージを注入
+	for i := range 10 {
+		role := "user"
+		if i%2 == 1 {
+			role = "assistant"
+		}
+		defaultAgent.Sessions.AddMessage(sessionKey, role, fmt.Sprintf("message-%d", i))
+	}
+
+	// maybeSummarize を直接呼ぶ
+	al.maybeSummarize(defaultAgent, sessionKey, "test", "chat1")
+
+	// 履歴が 3 件にトランケートされていることを確認
+	finalHistory := defaultAgent.Sessions.GetHistory(sessionKey)
+	if len(finalHistory) != 3 {
+		t.Errorf("Expected 3 messages after drop, got %d", len(finalHistory))
+	}
+
+	// 最後の3件が保持されていることを確認
+	if finalHistory[0].Content != "message-7" {
+		t.Errorf("Expected last kept message to be 'message-7', got '%s'", finalHistory[0].Content)
+	}
+}
