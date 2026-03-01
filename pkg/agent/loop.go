@@ -97,66 +97,77 @@ func registerSharedTools(
 		if !ok {
 			continue
 		}
-
-		// Web tools
-		if searchTool := tools.NewWebSearchTool(tools.WebSearchToolOptions{
-			BraveAPIKey:          cfg.Tools.Web.Brave.APIKey,
-			BraveMaxResults:      cfg.Tools.Web.Brave.MaxResults,
-			BraveEnabled:         cfg.Tools.Web.Brave.Enabled,
-			TavilyAPIKey:         cfg.Tools.Web.Tavily.APIKey,
-			TavilyBaseURL:        cfg.Tools.Web.Tavily.BaseURL,
-			TavilyMaxResults:     cfg.Tools.Web.Tavily.MaxResults,
-			TavilyEnabled:        cfg.Tools.Web.Tavily.Enabled,
-			DuckDuckGoMaxResults: cfg.Tools.Web.DuckDuckGo.MaxResults,
-			DuckDuckGoEnabled:    cfg.Tools.Web.DuckDuckGo.Enabled,
-			PerplexityAPIKey:     cfg.Tools.Web.Perplexity.APIKey,
-			PerplexityMaxResults: cfg.Tools.Web.Perplexity.MaxResults,
-			PerplexityEnabled:    cfg.Tools.Web.Perplexity.Enabled,
-			Proxy:                cfg.Tools.Web.Proxy,
-		}); searchTool != nil {
-			agent.Tools.Register(searchTool)
-		}
-		agent.Tools.Register(tools.NewWebFetchToolWithProxy(50000, cfg.Tools.Web.Proxy))
-
-		// Hardware tools (I2C, SPI) - Linux only, returns error on other platforms
-		agent.Tools.Register(tools.NewI2CTool())
-		agent.Tools.Register(tools.NewSPITool())
-
-		// Message tool
-		messageTool := tools.NewMessageTool()
-		messageTool.SetSendCallback(func(channel, chatID, content string) error {
-			pubCtx, pubCancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer pubCancel()
-			return msgBus.PublishOutbound(pubCtx, bus.OutboundMessage{
-				Channel: channel,
-				ChatID:  chatID,
-				Content: content,
-			})
-		})
-		agent.Tools.Register(messageTool)
-
-		// Skill discovery and installation tools
-		registryMgr := skills.NewRegistryManagerFromConfig(skills.RegistryConfig{
-			MaxConcurrentSearches: cfg.Tools.Skills.MaxConcurrentSearches,
-			ClawHub:               skills.ClawHubConfig(cfg.Tools.Skills.Registries.ClawHub),
-		})
-		searchCache := skills.NewSearchCache(
-			cfg.Tools.Skills.SearchCache.MaxSize,
-			time.Duration(cfg.Tools.Skills.SearchCache.TTLSeconds)*time.Second,
-		)
-		agent.Tools.Register(tools.NewFindSkillsTool(registryMgr, searchCache))
-		agent.Tools.Register(tools.NewInstallSkillTool(registryMgr, agent.Workspace))
-
-		// Spawn tool with allowlist checker
-		subagentManager := tools.NewSubagentManager(provider, agent.Model, agent.Workspace, msgBus)
-		subagentManager.SetLLMOptions(agent.MaxTokens, agent.Temperature)
-		spawnTool := tools.NewSpawnTool(subagentManager)
-		currentAgentID := agentID
-		spawnTool.SetAllowlistChecker(func(targetAgentID string) bool {
-			return registry.CanSpawnSubagent(currentAgentID, targetAgentID)
-		})
-		agent.Tools.Register(spawnTool)
+		registerSharedToolsForAgent(cfg, msgBus, registry, provider, agentID, agent)
 	}
+}
+
+// registerSharedToolsForAgent registers shared tools for a single agent instance.
+func registerSharedToolsForAgent(
+	cfg *config.Config,
+	msgBus *bus.MessageBus,
+	registry *AgentRegistry,
+	provider providers.LLMProvider,
+	agentID string,
+	agent *AgentInstance,
+) {
+	// Web tools
+	if searchTool := tools.NewWebSearchTool(tools.WebSearchToolOptions{
+		BraveAPIKey:          cfg.Tools.Web.Brave.APIKey,
+		BraveMaxResults:      cfg.Tools.Web.Brave.MaxResults,
+		BraveEnabled:         cfg.Tools.Web.Brave.Enabled,
+		TavilyAPIKey:         cfg.Tools.Web.Tavily.APIKey,
+		TavilyBaseURL:        cfg.Tools.Web.Tavily.BaseURL,
+		TavilyMaxResults:     cfg.Tools.Web.Tavily.MaxResults,
+		TavilyEnabled:        cfg.Tools.Web.Tavily.Enabled,
+		DuckDuckGoMaxResults: cfg.Tools.Web.DuckDuckGo.MaxResults,
+		DuckDuckGoEnabled:    cfg.Tools.Web.DuckDuckGo.Enabled,
+		PerplexityAPIKey:     cfg.Tools.Web.Perplexity.APIKey,
+		PerplexityMaxResults: cfg.Tools.Web.Perplexity.MaxResults,
+		PerplexityEnabled:    cfg.Tools.Web.Perplexity.Enabled,
+		Proxy:                cfg.Tools.Web.Proxy,
+	}); searchTool != nil {
+		agent.Tools.Register(searchTool)
+	}
+	agent.Tools.Register(tools.NewWebFetchToolWithProxy(50000, cfg.Tools.Web.Proxy))
+
+	// Hardware tools (I2C, SPI) - Linux only, returns error on other platforms
+	agent.Tools.Register(tools.NewI2CTool())
+	agent.Tools.Register(tools.NewSPITool())
+
+	// Message tool
+	messageTool := tools.NewMessageTool()
+	messageTool.SetSendCallback(func(channel, chatID, content string) error {
+		pubCtx, pubCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer pubCancel()
+		return msgBus.PublishOutbound(pubCtx, bus.OutboundMessage{
+			Channel: channel,
+			ChatID:  chatID,
+			Content: content,
+		})
+	})
+	agent.Tools.Register(messageTool)
+
+	// Skill discovery and installation tools
+	registryMgr := skills.NewRegistryManagerFromConfig(skills.RegistryConfig{
+		MaxConcurrentSearches: cfg.Tools.Skills.MaxConcurrentSearches,
+		ClawHub:               skills.ClawHubConfig(cfg.Tools.Skills.Registries.ClawHub),
+	})
+	searchCache := skills.NewSearchCache(
+		cfg.Tools.Skills.SearchCache.MaxSize,
+		time.Duration(cfg.Tools.Skills.SearchCache.TTLSeconds)*time.Second,
+	)
+	agent.Tools.Register(tools.NewFindSkillsTool(registryMgr, searchCache))
+	agent.Tools.Register(tools.NewInstallSkillTool(registryMgr, agent.Workspace))
+
+	// Spawn tool with allowlist checker
+	subagentManager := tools.NewSubagentManager(provider, agent.Model, agent.Workspace, msgBus)
+	subagentManager.SetLLMOptions(agent.MaxTokens, agent.Temperature)
+	spawnTool := tools.NewSpawnTool(subagentManager)
+	currentAgentID := agentID
+	spawnTool.SetAllowlistChecker(func(targetAgentID string) bool {
+		return registry.CanSpawnSubagent(currentAgentID, targetAgentID)
+	})
+	agent.Tools.Register(spawnTool)
 }
 
 func (al *AgentLoop) Run(ctx context.Context) error {
@@ -235,6 +246,20 @@ func (al *AgentLoop) Run(ctx context.Context) error {
 
 func (al *AgentLoop) Stop() {
 	al.running.Store(false)
+}
+
+// Registry returns the agent registry.
+func (al *AgentLoop) Registry() *AgentRegistry {
+	return al.registry
+}
+
+// RegisterToolsForAgent registers shared tools for a dynamically added agent.
+func (al *AgentLoop) RegisterToolsForAgent(agentID string) {
+	agent, ok := al.registry.GetAgent(agentID)
+	if !ok {
+		return
+	}
+	registerSharedToolsForAgent(al.cfg, al.bus, al.registry, agent.Provider, agentID, agent)
 }
 
 func (al *AgentLoop) RegisterTool(tool tools.Tool) {

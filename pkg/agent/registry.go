@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"fmt"
 	"sync"
 
 	"github.com/sipeed/picoclaw/pkg/config"
@@ -21,10 +22,16 @@ func NewAgentRegistry(
 	cfg *config.Config,
 	provider providers.LLMProvider,
 ) *AgentRegistry {
+	resolver := routing.NewRouteResolver(cfg)
 	registry := &AgentRegistry{
 		agents:   make(map[string]*AgentInstance),
-		resolver: routing.NewRouteResolver(cfg),
+		resolver: resolver,
 	}
+	// 動的 Agent の存在チェックを RouteResolver にワイヤリング
+	resolver.SetAgentExistsChecker(func(id string) bool {
+		_, ok := registry.GetAgent(id)
+		return ok
+	})
 
 	agentConfigs := cfg.Agents.List
 	if len(agentConfigs) == 0 {
@@ -52,6 +59,19 @@ func NewAgentRegistry(
 	}
 
 	return registry
+}
+
+// AddAgent registers a new AgentInstance at runtime.
+// Returns an error if the same ID is already registered.
+func (r *AgentRegistry) AddAgent(instance *AgentInstance) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	id := routing.NormalizeAgentID(instance.ID)
+	if _, exists := r.agents[id]; exists {
+		return fmt.Errorf("agent %q already registered", id)
+	}
+	r.agents[id] = instance
+	return nil
 }
 
 // GetAgent returns the agent instance for a given ID.
