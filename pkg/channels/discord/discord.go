@@ -470,6 +470,12 @@ func (c *DiscordChannel) downloadAttachment(url, filename string) string {
 
 // stripBotMention removes the bot mention from the message content.
 // Discord mentions have the format <@USER_ID> or <@!USER_ID> (with nickname).
+// Session returns the underlying discordgo session.
+// This allows external code to register additional handlers (e.g., slash commands).
+func (c *DiscordChannel) Session() *discordgo.Session {
+	return c.session
+}
+
 func (c *DiscordChannel) stripBotMention(text string) string {
 	if c.botUserID == "" {
 		return text

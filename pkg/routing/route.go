@@ -28,12 +28,19 @@ type ResolvedRoute struct {
 
 // RouteResolver determines which agent handles a message based on config bindings.
 type RouteResolver struct {
-	cfg *config.Config
+	cfg         *config.Config
+	agentExists func(string) bool // 動的 Agent の存在確認用（nil なら cfg.Agents.List のみ参照）
 }
 
 // NewRouteResolver creates a new route resolver.
 func NewRouteResolver(cfg *config.Config) *RouteResolver {
 	return &RouteResolver{cfg: cfg}
+}
+
+// SetAgentExistsChecker sets a callback to check if a dynamically registered agent exists.
+// When set, pickAgentID will also consult this function in addition to cfg.Agents.List.
+func (r *RouteResolver) SetAgentExistsChecker(fn func(string) bool) {
+	r.agentExists = fn
 }
 
 // ResolveRoute determines which agent handles the message and constructs session keys.
@@ -228,6 +235,10 @@ func (r *RouteResolver) pickAgentID(agentID string) string {
 		if NormalizeAgentID(a.ID) == normalized {
 			return normalized
 		}
+	}
+	// 動的に登録された Agent もチェック
+	if r.agentExists != nil && r.agentExists(normalized) {
+		return normalized
 	}
 	return NormalizeAgentID(r.resolveDefaultAgentID())
 }
