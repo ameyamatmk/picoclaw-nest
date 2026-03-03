@@ -55,7 +55,7 @@ func (t *CronTool) Name() string {
 
 // Description returns the tool description
 func (t *CronTool) Description() string {
-	return "Schedule reminders, tasks, or system commands. IMPORTANT: When user asks to be reminded or scheduled, you MUST call this tool. Use 'at_seconds' for one-time reminders (e.g., 'remind me in 10 minutes' → at_seconds=600). Use 'every_seconds' ONLY for recurring tasks (e.g., 'every 2 hours' → every_seconds=7200). Use 'cron_expr' for complex recurring schedules. Use 'command' to execute shell commands directly."
+	return "Schedule reminders, tasks, or system commands. IMPORTANT: When user asks to be reminded or scheduled, you MUST call this tool. Use 'at_seconds' for one-time reminders (e.g., 'remind me in 10 minutes' → at_seconds=600). Use 'every_seconds' ONLY for recurring tasks (e.g., 'every 2 hours' → every_seconds=7200). Use 'cron_expr' for complex recurring schedules. For tasks requiring creativity, reasoning, summarization, or dynamic text generation, set deliver=false and write instructions in 'message' — the agent will process it using available tools (read_file, etc.). Only use 'command' for simple, deterministic shell commands like 'df -h' or 'uptime'."
 }
 
 // Parameters returns the tool parameters schema
@@ -70,11 +70,11 @@ func (t *CronTool) Parameters() map[string]any {
 			},
 			"message": map[string]any{
 				"type":        "string",
-				"description": "The reminder/task message to display when triggered. If 'command' is used, this describes what the command does.",
+				"description": "The reminder/task content. When deliver=true, this text is sent directly to the channel as-is. When deliver=false, this is treated as an instruction for the agent to process — the agent can use tools (read_file, exec, etc.) and generate a dynamic response. Example: 'Read yesterday's daily file from memory/daily/ and write a morning greeting based on its content.'",
 			},
 			"command": map[string]any{
 				"type":        "string",
-				"description": "Optional: Shell command to execute directly (e.g., 'df -h'). If set, the agent will run this command and report output instead of just showing the message. 'deliver' will be forced to false for commands.",
+				"description": "Optional: A simple, deterministic shell command to execute (e.g., 'df -h', 'uptime'). Do NOT use this for tasks that need reasoning, summarization, or dynamic text generation — use message with deliver=false instead. Do NOT write shell scripts with variable expansion ($(...), ${...}) as they will be blocked by the safety guard.",
 			},
 			"at_seconds": map[string]any{
 				"type":        "integer",
@@ -94,7 +94,7 @@ func (t *CronTool) Parameters() map[string]any {
 			},
 			"deliver": map[string]any{
 				"type":        "boolean",
-				"description": "If true, send message directly to channel. If false, let agent process message (for complex tasks). Default: true",
+				"description": "If true, send 'message' directly to the channel without any processing. If false, the agent will receive 'message' as an instruction and process it (can read files, generate text, use tools). Set to false for tasks requiring dynamic content generation. Default: true",
 			},
 		},
 		"required": []string{"action"},
